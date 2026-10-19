@@ -251,7 +251,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
         commit_result_ = metadata_.save(input_);
         return commit_result_;
     }
-    HRESULT STDMETHODCALLTYPE Open(IStream *stream, DWORD) override {
+    HRESULT STDMETHODCALLTYPE Open(IStream *stream, DWORD flags) override {
         if (!stream)
             return E_POINTER;
         if (input_.stream || commit_attempted_)
@@ -264,12 +264,12 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
                 if (FAILED(hr))
                     content_.reset();
             }
-            input_.signature(tta_ ? "TTA1" : "fLaC");
             if (tta_) {
-                tta_decoder_.open(input_);
+                tta_decoder_.open(input_, (flags & 1) != 0);
                 format_ = tta_decoder_.format();
                 samples_ = tta_decoder_.total();
             } else {
+                input_.signature("fLaC");
                 metadata_.read(input_);
                 if (content_) {
                     DWORD n{};

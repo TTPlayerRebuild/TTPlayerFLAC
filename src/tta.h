@@ -7,7 +7,7 @@ class TtaDecoder {
     uint64_t total_{}, position_{};
     DWORD frame_length_{}, frame_index_{}, frame_count_{};
     std::vector<uint64_t> offsets_;
-    bool table_valid_{};
+    bool table_valid_{}, prepared_{};
     Bytes bytes_; // Allocated only by TTA Open; FLAC readers need no TTA cache.
     size_t begin_{}, end_{};
     uint64_t bits_{};
@@ -18,12 +18,13 @@ class TtaDecoder {
     uint32_t bits(unsigned n);
     uint32_t unary();
     void reset_bits();
+    void prepare();
 
   public:
-    void open(Input &input);
+    void open(Input &input, bool prepare_decoder);
     bool read(Bytes &pcm);
     void seek_sample(uint64_t sample);
-    bool seekable() const { return table_valid_ && input_->seekable; }
+    bool seekable() const { return (!prepared_ || table_valid_) && input_->seekable; }
     uint64_t total() const { return total_; }
     const WAVEFORMATEX &format() const { return format_; }
 };

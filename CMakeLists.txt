@@ -9,10 +9,11 @@ include(cmake/legacy_windows.cmake)
 include(cmake/size_release.cmake)
 include(cmake/flac.cmake)
 include(cmake/version.cmake)
+include(third_party/ttpcomm/cmake/verify.cmake)
 add_library(ttp_flac SHARED src/plugin.cpp src/reader.cpp src/metadata.cpp src/external_tags.cpp src/tta.cpp
   src/ttp_flac.def "${CMAKE_CURRENT_BINARY_DIR}/generated/version.rc")
 add_dependencies(ttp_flac ttp_flac_version)
-target_include_directories(ttp_flac PUBLIC include PRIVATE src)
+target_include_directories(ttp_flac PUBLIC include PRIVATE src third_party/ttpcomm/include)
 target_compile_definitions(ttp_flac PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
   _WIN32_WINNT=0x0501 _CRT_SECURE_NO_WARNINGS)
 target_compile_options(ttp_flac PRIVATE /W4 /permissive- /EHsc /GR- /Os /Gy /Gw /GF /utf-8 /fp:precise /arch:SSE2)

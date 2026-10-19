@@ -369,7 +369,7 @@ HRESULT NativeMetadata::save(Input &input) noexcept {
         copy(input.stream.p, next.stream.p, (migrate ? external.end : size) - audio, scratch);
         if (migrate)
             write_exact(next.stream.p, external.suffix.data(), DWORD(external.suffix.size()));
-        check(next.stream->Commit(STGC_DEFAULT));
+        commit_stream(next.stream.p);
         uint64_t newsize = tell(next.stream.p);
         // Existing hosts may retain a non-delete-sharing file handle. Prefer an
         // atomic path replacement; use the original writable stream with a full
@@ -397,7 +397,7 @@ HRESULT NativeMetadata::save(Input &input) noexcept {
         Temporary backup(directory);
         seek(writable.p, 0);
         copy(writable.p, backup.stream.p, size, scratch);
-        check(backup.stream->Commit(STGC_DEFAULT));
+        commit_stream(backup.stream.p);
         check(SHCreateStreamOnFileEx(next.path.c_str(), STGM_READ | STGM_SHARE_DENY_WRITE, 0, FALSE,
                                      nullptr, next.stream.put()));
         auto overwrite = [&](IStream *from, uint64_t length) {
@@ -407,7 +407,7 @@ HRESULT NativeMetadata::save(Input &input) noexcept {
             ULARGE_INTEGER n{};
             n.QuadPart = length;
             check(writable->SetSize(n));
-            check(writable->Commit(STGC_DEFAULT));
+            commit_stream(writable.p);
         };
         auto hr = protect([&]() -> HRESULT {
             overwrite(next.stream.p, newsize);

@@ -116,12 +116,21 @@ uint32_t TtaDecoder::unary() {
     }
     return n;
 }
-void TtaDecoder::open(Input &input) {
-    bytes_.resize(65536);
+void TtaDecoder::open(Input &input, bool prepare_decoder) {
     input_ = &input;
-    input.at(input.base);
+    require(input.seekable, STG_E_INVALIDFUNCTION);
+    input.base = tell(input.stream.p);
     BYTE h[22];
     input.exact(h, 22);
+    if (!memcmp(h, "ID3", 3)) {
+        require(!((h[6] | h[7] | h[8] | h[9]) & 128));
+        const uint64_t length = (uint32_t(h[6]) << 21) | (uint32_t(h[7]) << 14) |
+                                (uint32_t(h[8]) << 7) | h[9];
+        require(length <= 16 * 1024 * 1024);
+        input.base += 10 + length + ((h[3] == 4 && (h[5] & 16)) ? 10 : 0);
+        input.at(input.base);
+        input.exact(h, 22);
+    }
     require(!memcmp(h, "TTA1", 4) && crc(h, 18) == le32(h + 18));
     format_.wFormatTag = le16(h + 4);
     format_.nChannels = le16(h + 6);
@@ -141,10 +150,21 @@ void TtaDecoder::open(Input &input) {
     require(frame_length_ && uint64_t(frame_length_) * format_.nBlockAlign <= 64 * 1024 * 1024);
     frame_count_ = DWORD((total_ + frame_length_ - 1) / frame_length_);
     require(frame_count_ <= 4 * 1024 * 1024);
+    // Original 60303E3E skips 60304381 when flags bit zero is clear.
+    // Metadata scans need only the 22-byte header, not the entire seek table.
+    if (prepare_decoder)
+        prepare();
+}
+void TtaDecoder::prepare() {
+    if (prepared_)
+        return;
+    auto &input = *input_;
+    input.at(input.base + 22);
     Bytes table((size_t(frame_count_) + 1) * 4);
     input.exact(table.data(), DWORD(table.size()));
     table_valid_ = crc(table.data(), table.size() - 4) == le32(table.data() + table.size() - 4);
     uint64_t offset = input.base + 22 + table.size();
+    offsets_.clear();
     offsets_.reserve(frame_count_ + 1);
     for (DWORD i = 0; i < frame_count_; ++i) {
         offsets_.push_back(offset);
@@ -156,9 +176,12 @@ void TtaDecoder::open(Input &input) {
     offsets_.push_back(offset);
     if (input.size && offset > input.size)
         table_valid_ = false;
+    bytes_.resize(65536);
+    prepared_ = true;
     reset_bits();
 }
 bool TtaDecoder::read(Bytes &pcm) {
+    prepare();
     if (frame_index_ >= frame_count_) {
         pcm.clear();
         return false;
@@ -243,6 +266,7 @@ bool TtaDecoder::read(Bytes &pcm) {
 }
 void TtaDecoder::seek_sample(uint64_t sample) {
     require(sample <= total_, E_INVALIDARG);
+    prepare();
     require(seekable(), STG_E_INVALIDFUNCTION);
     frame_index_ = sample == total_ ? frame_count_ : DWORD(sample / frame_length_);
     input_->at(offsets_[frame_index_]);

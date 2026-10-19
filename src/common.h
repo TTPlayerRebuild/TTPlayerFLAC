@@ -24,6 +24,13 @@ inline void check(HRESULT hr) {
     if (FAILED(hr))
         throw Failure{hr};
 }
+inline void commit_stream(IStream *stream) {
+    // Legacy direct file streams write immediately and do not implement the
+    // optional transaction/flush method. Real I/O failures must still propagate.
+    const HRESULT hr = stream->Commit(STGC_DEFAULT);
+    if (hr != E_NOTIMPL && hr != STG_E_INVALIDFUNCTION)
+        check(hr);
+}
 template <class F> HRESULT protect(F &&f) noexcept {
     try {
         return f();

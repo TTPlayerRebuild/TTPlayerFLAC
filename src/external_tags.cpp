@@ -1,4 +1,5 @@
 #include "external_tags.h"
+#include <ttpcomm/tags.h>
 namespace ttp::flac {
 namespace {
 constexpr size_t limit = 16 * 1024 * 1024;
@@ -33,40 +34,75 @@ Bytes id3_prefix(Input &in) {
     require(b.size() >= 10 && !memcmp(b.data(), "ID3", 3), E_NOTIMPL);
     unsigned major = b[3];
     require(major >= 2 && major <= 4 && b[4] == 0, E_NOTIMPL);
-    // Global unsynchronization, extended headers and compressed/encrypted
-    // text need a separate rewrite policy. Reject edits before dirtying state.
-    require((b[5] & ~0x10u) == 0 && (major == 4 || b[5] == 0), E_NOTIMPL);
+    const unsigned flags = b[5];
     size_t n = sync32(b.data() + 6), end = 10 + n;
-    require(end + ((b[5] & 16) ? 10 : 0) == b.size(), E_NOTIMPL);
-    Bytes kept;
-    size_t p = 10, header = major == 2 ? 6 : 10, ids = major == 2 ? 3 : 4;
-    while (p < end && b[p]) {
-        require(end - p >= header, E_NOTIMPL);
-        std::string id(reinterpret_cast<const char *>(b.data() + p), ids);
-        for (auto c : id)
-            require((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'), E_NOTIMPL);
-        DWORD size = major == 2   ? (DWORD(b[p + 3]) << 16) | (DWORD(b[p + 4]) << 8) | b[p + 5]
-                     : major == 3 ? be32(b.data() + p + 4)
-                                  : sync32(b.data() + p + 4);
-        require(size <= end - p - header, E_NOTIMPL);
-        if (text_frame(id)) {
-            require(major == 2 || !(b[p + 9] & (major == 3 ? 0xc0 : 0x0e)), E_NOTIMPL);
-        } else
-            kept.insert(kept.end(), b.begin() + p, b.begin() + p + header + size);
-        p += header + size;
+    const bool footer = major == 4 && (flags & 16);
+    require(end + (footer ? 10 : 0) == b.size(), E_NOTIMPL);
+    if (footer)
+        require(!memcmp(b.data() + end, "3DI", 3) &&
+                    !memcmp(b.data() + end + 3, b.data() + 3, 7), E_NOTIMPL);
+    using ttpcomm::bytes::View;
+    namespace tags = ttpcomm::tags;
+    View body(b.data() + 10, n);
+    Bytes decoded;
+    // v2.2/2.3 lengths describe the decoded body; v2.4 lengths describe the
+    // stored frame payload. Its tag bit applies to every frame, not its header.
+    if (major < 4 && (flags & 0x80)) {
+        decoded = tags::RemoveUnsynchronization(body);
+        body = View(decoded.data(), decoded.size());
     }
-    while (p < end)
-        require(b[p++] == 0, E_NOTIMPL);
+    const auto start = tags::FrameStart(body, major, flags);
+    require(start.has_value(), E_NOTIMPL); // Includes extended-header CRC checks.
+    Bytes kept;
+    size_t p = *start;
+    for (;;) {
+        tags::Frame frame;
+        const auto status = tags::NextFrame(body, major, p, frame);
+        require(status != tags::FrameStatus::invalid, E_NOTIMPL);
+        if (status == tags::FrameStatus::end)
+            break;
+        if (text_frame(std::string(frame.identifier))) {
+            // The host has already supplied readable fields. A compressed or
+            // encrypted text frame may not have been exposed; do not silently
+            // drop it together with unrelated edits. Unknown/binary frames are
+            // opaque and retain all of their status/format flags and payloads.
+            require(major == 2 || !(frame.flags & (major == 3 ? 0xdfu : 0xbcu)),
+                    E_NOTIMPL);
+        } else {
+            kept.insert(kept.end(), frame.raw.begin(), frame.raw.end());
+        }
+    }
+    while (p < body.size())
+        require(body[p++] == 0, E_NOTIMPL);
     if (kept.empty())
         return {};
+    if (major < 4 && (flags & 0x80)) {
+        Bytes encoded;
+        encoded.reserve(kept.size());
+        for (size_t i = 0; i < kept.size(); ++i) {
+            encoded.push_back(kept[i]);
+            if (kept[i] == 0xff &&
+                (i + 1 == kept.size() || kept[i + 1] == 0 || kept[i + 1] >= 0xe0))
+                encoded.push_back(0);
+        }
+        kept.swap(encoded);
+    }
+    require(kept.size() <= limit, E_NOTIMPL);
     Bytes out(b.begin(), b.begin() + 10);
-    out[5] = 0;
+    // Remove the extended header and its obsolete CRC/restrictions. Preserve
+    // global unsynchronization, the experimental bit, and a matching footer.
+    out[5] = BYTE(flags & ~0x40u);
     n = kept.size();
     for (int i = 9; i >= 6; --i) {
         out[i] = BYTE(n & 127);
         n >>= 7;
     }
     out.insert(out.end(), kept.begin(), kept.end());
+    if (footer) {
+        Bytes tail(out.begin(), out.begin() + 10);
+        memcpy(tail.data(), "3DI", 3);
+        out.insert(out.end(), tail.begin(), tail.end());
+    }
     return out;
 }
 } // namespace

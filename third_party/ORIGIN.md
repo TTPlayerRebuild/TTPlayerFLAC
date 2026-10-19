@@ -2,6 +2,8 @@
 
 记录日期：2026-10-03。源码仓库不收录下载的依赖源码或编译产物。
 
+2026-10-19新增 `ttpcomm/` 固定SDK快照，用于复用本项目重建的ID3帧/unsync/扩展头校验。通过上游 `cmake/sync_sdk.py` 导出，构建校验SDK_MANIFEST.json。只编译头文件辅助函数，不调用新版ttpcomm运行时，也不依赖相邻源码目录。此快照是重建项目自身公共代码，不是下载的第三方解码库源码。
+
 | 组件 | 固定版本 | 用途 | 本地声明 |
 | --- | --- | --- | --- |
 | libFLAC | 1.5.0 | 静态链接的 native FLAC 解码器 | [COPYING.Xiph](libFLAC/COPYING.Xiph) |
