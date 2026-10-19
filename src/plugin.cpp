@@ -1,3 +1,4 @@
+#include "ttpcomm/audio_format_probe_impl.h"
 #include "common.h"
 
 namespace ttp::flac {
@@ -12,13 +13,20 @@ StandardContent standard_content() {
     }
     return nullptr;
 }
-class ReaderFactory final : public ReaderCreator {
+class ReaderFactory final : public ReaderCreator, public ttp::format::ProbeSupport {
+protected:
+    DWORD ProbeFamilies() const noexcept override { return tta_ ? ttp::format::Tta : ttp::format::Flac; }
+private:
+
     LONG references_{1};
     bool tta_;
 
   public:
     explicit ReaderFactory(bool tta) : tta_(tta) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(iid, ttp::format::iid_probe)) { *out=static_cast<ttp::format::Probe*>(this); AddRef(); return S_OK; }
+
         if (!out)
             return E_POINTER;
         *out = nullptr;

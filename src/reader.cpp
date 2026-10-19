@@ -1,9 +1,10 @@
+#include "ttpcomm/audio_format_probe_impl.h"
 #include "metadata.h"
 #include "tta.h"
 #include <FLAC/stream_decoder.h>
 namespace ttp::flac {
 namespace {
-class AudioReader final : public Reader, public Metadata, public Thumbnail, public MetadataCommit {
+class AudioReader final : public Reader, public Metadata, public Thumbnail, public MetadataCommit, public ttp::format::InfoSupport {
     LONG refs_{1};
     bool tta_{}, opened_{}, eof_{};
     Input input_;
@@ -214,6 +215,9 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
   public:
     explicit AudioReader(bool tta) : tta_(tta) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(id, ttp::format::iid_info)) { *out=static_cast<ttp::format::SourceInfo*>(this); AddRef(); return S_OK; }
+
         if (!out)
             return E_POINTER;
         *out = nullptr;
@@ -251,7 +255,12 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
         commit_result_ = metadata_.save(input_);
         return commit_result_;
     }
-    HRESULT STDMETHODCALLTYPE Open(IStream *stream, DWORD flags) override {
+    HRESULT STDMETHODCALLTYPE Open(IStream* probe_stream, DWORD probe_flags) override {
+        const auto probed = PrepareFormatInfo(probe_stream, tta_ ? ttp::format::Tta : ttp::format::Flac);
+        if (FAILED(probed)) return probed;
+        return CompleteFormatInfo(OpenImpl(probe_stream, probe_flags));
+    }
+    HRESULT OpenImpl(IStream *stream, DWORD flags) {
         if (!stream)
             return E_POINTER;
         if (input_.stream || commit_attempted_)
