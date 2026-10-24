@@ -1,5 +1,9 @@
 # ttp_flac
 
+最新补全与验收：[2026-10-24](docs/COMPLETION_20261024.md)。
+
+TTA 历史浮点位模式与三系统定位验证：[边界记录](docs/TTA_FLOAT_BOUNDARIES_20261024.md)。
+
 供千千静听原版与 TTPlayer Rebuild 使用的独立 x86 **FLAC / TTA 输入插件**。
 
 根据原 `AddIn/ttp_flac.dll` 的伪代码、二进制接口和实际输出重建，恢复两个 Reader 工厂。FLAC 使用固定版本 **libFLAC 1.5.0**；TTA 的 Rice 解码、预测、滤波、声道还原及历史浮点分支在本项目中实现。

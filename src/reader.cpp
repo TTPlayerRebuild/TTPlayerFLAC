@@ -1,4 +1,5 @@
 #include "ttpcomm/audio_format_probe_impl.h"
+#include "ttpcomm/pcm_format.h"
 #include "metadata.h"
 #include "tta.h"
 #include <FLAC/stream_decoder.h>
@@ -12,7 +13,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     NativeMetadata metadata_;
     TtaDecoder tta_decoder_;
     FLAC__StreamDecoder *decoder_{};
-    WAVEFORMATEX format_{};
+    WAVEFORMATEX format_{}; WORD valid_bits_{};
     uint64_t samples_{}, position_{}, skip_{};
     DWORD duration_{}, bitrate_{};
     Bytes pcm_;
@@ -91,7 +92,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
         auto hr = protect([&]() -> HRESULT {
             check(s.error_);
             require(f && f->header.channels == s.format_.nChannels &&
-                        f->header.bits_per_sample == s.format_.wBitsPerSample &&
+                        f->header.bits_per_sample == s.valid_bits_ &&
                         f->header.sample_rate == s.format_.nSamplesPerSec,
                     E_NOTIMPL);
             require(f->header.blocksize && f->header.blocksize <= 65535);
@@ -102,7 +103,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
             size_t at{};
             for (unsigned i = 0; i < f->header.blocksize; ++i)
                 for (unsigned c = 0; c < f->header.channels; ++c) {
-                    uint32_t v = uint32_t(data[c][i]);
+                    uint32_t v = uint32_t(data[c][i]) << (s.format_.wBitsPerSample-s.valid_bits_);
                     if (bytes == 1)
                         v ^= 128;
                     for (unsigned b = 0; b < bytes; ++b)
@@ -124,9 +125,10 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
         const auto &i = m->data.stream_info;
         s.format_.wFormatTag = WAVE_FORMAT_PCM;
         s.format_.nChannels = WORD(i.channels);
-        s.format_.wBitsPerSample = WORD(i.bits_per_sample);
+        s.valid_bits_ = WORD(i.bits_per_sample);
+        s.format_.wBitsPerSample = WORD((i.bits_per_sample+7)/8*8);
         s.format_.nSamplesPerSec = i.sample_rate;
-        s.format_.nBlockAlign = WORD(i.channels * (i.bits_per_sample / 8));
+        s.format_.nBlockAlign = WORD(i.channels * ((i.bits_per_sample+7) / 8));
         s.format_.nAvgBytesPerSec = s.format_.nBlockAlign * i.sample_rate;
         s.samples_ = i.total_samples;
     }
@@ -317,6 +319,8 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
             require(format_.wBitsPerSample == 8 || format_.wBitsPerSample == 16 ||
                         format_.wBitsPerSample == 24 || format_.wBitsPerSample == 32,
                     E_NOTIMPL);
+            if(tta_)valid_bits_=format_.wBitsPerSample;
+            require(valid_bits_>=4 && valid_bits_<=32);
             duration_ = milliseconds(samples_, format_.nSamplesPerSec);
             if (duration_)
                 bitrate_ = dword(input_.size > UINT64_MAX / 8000 ? MAXDWORD
@@ -340,17 +344,8 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Format(WAVEFORMATEX **out) override {
-        if (!out)
-            return E_POINTER;
-        *out = nullptr;
-        if (!opened_)
-            return E_UNEXPECTED;
-        auto *p = static_cast<WAVEFORMATEX *>(CoTaskMemAlloc(sizeof(format_)));
-        if (!p)
-            return E_OUTOFMEMORY;
-        *p = format_;
-        *out = p;
-        return S_OK;
+        if(!out)return E_POINTER;*out=nullptr;if(!opened_)return E_UNEXPECTED;
+        return ttp::pcm::copy_format(format_, tta_ ? 0 : ttp::pcm::standard_mask(format_.nChannels), valid_bits_, out);
     }
     HRESULT STDMETHODCALLTYPE BufferSize(DWORD *out) override {
         if (!out)
@@ -370,7 +365,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     HRESULT STDMETHODCALLTYPE BitDepth(WORD *out) override {
         if (!out)
             return E_POINTER;
-        *out = format_.wBitsPerSample;
+        *out = valid_bits_;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetCallback(IUnknown *p) override {
