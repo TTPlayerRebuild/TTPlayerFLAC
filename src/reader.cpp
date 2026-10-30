@@ -2,10 +2,11 @@
 #include "ttpcomm/pcm_format.h"
 #include "metadata.h"
 #include "tta.h"
+#include "dts_carrier.h"
 #include <FLAC/stream_decoder.h>
 namespace ttp::flac {
 namespace {
-class AudioReader final : public Reader, public Metadata, public Thumbnail, public MetadataCommit, public ttp::format::InfoSupport {
+class AudioReader final : public Reader, public Metadata, public Thumbnail, public MetadataCommit, public ttp::format::InfoSupport, private CarrierBytes {
     LONG refs_{1};
     bool tta_{}, opened_{}, eof_{};
     Input input_;
@@ -23,6 +24,99 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     bool block_ready_{};
     bool commit_attempted_{};
     HRESULT commit_result_{S_OK};
+    Bytes lookahead_;
+    size_t lookahead_at_{};
+    uint64_t raw_cursor_{}, carrier_start_{}, carrier_size_{};
+    bool carrier_{};
+    HRESULT carrier_error_{S_OK};
+    CarrierDecoder carrier_decoder_;
+    uint64_t Size() const override { return carrier_size_; }
+    void seek_raw(uint64_t byte) {
+        const uint64_t sample=byte/format_.nBlockAlign;
+        error_=S_OK;sync_errors_=0;pcm_.clear();consumed_=0;
+        auto state=FLAC__stream_decoder_get_state(decoder_);
+        if(state==FLAC__STREAM_DECODER_ABORTED||state==FLAC__STREAM_DECODER_SEEK_ERROR)
+            require(FLAC__stream_decoder_flush(decoder_)!=0);
+        require(FLAC__stream_decoder_seek_absolute(decoder_,sample)!=0,
+                FAILED(error_)?error_:STG_E_SEEKERROR);
+        check(error_);
+        const auto remainder=size_t(byte%format_.nBlockAlign);
+        require(remainder<=pcm_.size(),STG_E_READFAULT);
+        consumed_=remainder;raw_cursor_=byte;position_=sample;
+    }
+    HRESULT ReadAt(uint64_t at,void *out,ULONG wanted,ULONG *got) override {
+        *got=0;
+        return protect([&]()->HRESULT{
+            require(WaitForSingleObject(input_.event,0)!=WAIT_OBJECT_0,
+                    HRESULT_FROM_WIN32(ERROR_CANCELLED));
+            require(at<=carrier_size_,STG_E_SEEKERROR);
+            wanted=ULONG(std::min<uint64_t>(wanted,carrier_size_-at));
+            if(!wanted)return S_OK;
+            const uint64_t physical=carrier_start_+at;
+            if(physical!=raw_cursor_)seek_raw(physical);
+            check(error_);
+            if(consumed_==pcm_.size())require(next_block(),STG_E_READFAULT);
+            const auto n=ULONG(std::min<size_t>(wanted,pcm_.size()-consumed_));
+            memcpy(out,pcm_.data()+consumed_,n);consumed_+=n;raw_cursor_+=n;
+            position_=raw_cursor_/format_.nBlockAlign;*got=n;return S_OK;
+        });
+    }
+    void detect_carrier(DWORD flags) {
+        if(tta_||valid_bits_!=16||format_.nChannels!=2||
+           (format_.nSamplesPerSec!=44100&&format_.nSamplesPerSec!=48000))return;
+        // Bounded prefix, preserving every byte for an ordinary PCM reader.
+        constexpr size_t limit=256*1024;
+        bool ended=false;
+        while(lookahead_.size()<limit){
+            if(consumed_==pcm_.size()&&!next_block()){ended=true;break;}
+            const auto n=std::min(limit-lookahead_.size(),pcm_.size()-consumed_);
+            lookahead_.insert(lookahead_.end(),pcm_.begin()+consumed_,pcm_.begin()+consumed_+n);
+            consumed_+=n;raw_cursor_+=n;position_=raw_cursor_/format_.nBlockAlign;
+        }
+        using namespace ttp::format;
+        const View view{lookahead_.data(),lookahead_.size()};
+        size_t found=lookahead_.size();
+        for(size_t at=0;at+16<=view.n;++at){
+            unsigned identity{};size_t pos=at;
+            unsigned frames=0;
+            for(;frames<3;++frames){
+                unsigned current{};const auto n=DtsFrame(view,pos,current);
+                if(!n||n>view.n-pos||(frames&&current!=identity))break;
+                identity=current;pos+=n;
+                // A historical 14-bit transport can omit its final partial word.
+                if(frames<2&&pos>=2){
+                    unsigned a{},b{};
+                    if(!DtsFrame(view,pos,a)&&DtsFrame(view,pos-2,b)&&b==identity)pos-=2;
+                }
+            }
+            if(frames==3||(frames==2&&ended&&pos==view.n)){found=at;break;}
+        }
+        if(found==lookahead_.size())return;
+        carrier_=true;carrier_start_=found;
+        carrier_error_=protect([&]()->HRESULT{
+            // STREAMINFO may omit total_samples. Only an identified carrier
+            // needs a full bounded-memory pass in that uncommon case.
+            if(!samples_){
+                do{
+                    const auto n=pcm_.size()-consumed_;raw_cursor_+=n;consumed_=pcm_.size();
+                    position_=raw_cursor_/format_.nBlockAlign;
+                }while(next_block());
+                samples_=raw_cursor_/format_.nBlockAlign;
+            }
+            require(samples_<=UINT64_MAX/format_.nBlockAlign);
+            const uint64_t total=samples_*format_.nBlockAlign;
+            require(total>=carrier_start_,STG_E_READFAULT);carrier_size_=total-carrier_start_;
+            carrier_decoder_.Open(module,*this,flags);
+            check(carrier_decoder_.reader->Duration(&duration_));return S_OK;
+        });
+        lookahead_.clear();lookahead_at_=0;
+        if(FAILED(carrier_error_)){
+            carrier_decoder_.Close();pcm_.clear();consumed_=0;
+            // Keep Open/Format valid but fail the first Read before output.
+            // Failing Open would let a host retry a generic FLAC decoder and
+            // accidentally play this compressed carrier as loud PCM noise.
+        }
+    }
     static FLAC__StreamDecoderReadStatus
     read_callback(const FLAC__StreamDecoder *, FLAC__byte out[], size_t *n, void *p) noexcept {
         auto &s = *static_cast<AudioReader *>(p);
@@ -149,6 +243,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
         }
     }
     ~AudioReader() {
+        carrier_decoder_.Close();
         close_decoder();
         if (!tta_) {
             content_.reset();
@@ -196,6 +291,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     bool next_block() {
         block_ready_ = false;
         consumed_ = 0;
+        pcm_.clear();
         check(error_);
         if (tta_)
             return tta_decoder_.read(pcm_);
@@ -252,6 +348,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
             return E_UNEXPECTED;
         commit_attempted_ = true;
         opened_ = false;
+        carrier_decoder_.Close();
         close_decoder();
         content_.reset();
         commit_result_ = metadata_.save(input_);
@@ -322,6 +419,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
             if(tta_)valid_bits_=format_.wBitsPerSample;
             require(valid_bits_>=4 && valid_bits_<=32);
             duration_ = milliseconds(samples_, format_.nSamplesPerSec);
+            detect_carrier(flags);
             if (duration_)
                 bitrate_ = dword(input_.size > UINT64_MAX / 8000 ? MAXDWORD
                                                                  : input_.size * 8000 / duration_);
@@ -345,15 +443,18 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     }
     HRESULT STDMETHODCALLTYPE Format(WAVEFORMATEX **out) override {
         if(!out)return E_POINTER;*out=nullptr;if(!opened_)return E_UNEXPECTED;
+        if(carrier_decoder_.reader)return carrier_decoder_.reader->Format(out);
         return ttp::pcm::copy_format(format_, tta_ ? 0 : ttp::pcm::standard_mask(format_.nChannels), valid_bits_, out);
     }
     HRESULT STDMETHODCALLTYPE BufferSize(DWORD *out) override {
         if (!out)
             return E_POINTER;
+        if(carrier_decoder_.reader)return carrier_decoder_.reader->BufferSize(out);
         *out = format_.nBlockAlign * (tta_ ? 2048 : 1024);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CodecName(wchar_t **out) override {
+        if(carrier_)return text(FAILED(carrier_error_)?L"FLAC|FLAC / DTS (decoder unavailable)":L"FLAC|FLAC / DTS",out);
         return text(tta_ ? L"TTA|True Audio" : L"FLAC|FLAC Audio", out);
     }
     HRESULT STDMETHODCALLTYPE Bitrate(DWORD *out) override {
@@ -365,6 +466,7 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     HRESULT STDMETHODCALLTYPE BitDepth(WORD *out) override {
         if (!out)
             return E_POINTER;
+        if(carrier_decoder_.reader)return carrier_decoder_.reader->BitDepth(out);
         *out = valid_bits_;
         return S_OK;
     }
@@ -373,11 +475,23 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
             return E_UNEXPECTED;
         return input_.callback(p);
     }
-    HRESULT STDMETHODCALLTYPE Start() override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE Stop() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Start() override {
+        if(carrier_){ResetEvent(input_.event);if(carrier_decoder_.reader)return carrier_decoder_.reader->Start();}
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Stop() override {
+        if(carrier_){SetEvent(input_.event);if(carrier_decoder_.reader)return carrier_decoder_.reader->Stop();}
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE Read(Buffer *buffer) override {
         if (!buffer)
             return E_POINTER;
+        if(carrier_){
+            auto hr=buffer->SetLength(0);if(FAILED(hr))return hr;
+            if(!opened_)return E_UNEXPECTED;
+            if(FAILED(carrier_error_))return carrier_error_;
+            return carrier_decoder_.reader->Read(buffer);
+        }
         const auto result = protect([&]() -> HRESULT {
             require(opened_, E_UNEXPECTED);
             check(buffer->SetLength(0));
@@ -391,6 +505,13 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
             check(buffer->Data(&data, &length));
             require(data, E_POINTER);
             capacity -= capacity % format_.nBlockAlign;
+            if(lookahead_at_<lookahead_.size()){
+                const DWORD n=DWORD(std::min<size_t>(capacity,lookahead_.size()-lookahead_at_));
+                memcpy(data,lookahead_.data()+lookahead_at_,n);check(buffer->SetLength(n));
+                lookahead_at_+=n;
+                if(lookahead_at_==lookahead_.size()){lookahead_.clear();lookahead_at_=0;}
+                return S_OK;
+            }
             while (consumed_ == pcm_.size()) {
                 if (!next_block()) {
                     eof_ = true;
@@ -416,11 +537,17 @@ class AudioReader final : public Reader, public Metadata, public Thumbnail, publ
     HRESULT STDMETHODCALLTYPE Seek(DWORD *ms) override {
         if (!ms)
             return E_POINTER;
+        if(carrier_){
+            if(!opened_)return E_UNEXPECTED;
+            if(FAILED(carrier_error_))return carrier_error_;
+            return carrier_decoder_.reader->Seek(ms);
+        }
         return protect([&]() -> HRESULT {
             require(opened_, E_UNEXPECTED);
             uint64_t sample = uint64_t(*ms) * format_.nSamplesPerSec / 1000;
             require(!samples_ || sample <= samples_, E_INVALIDARG);
             error_ = S_OK;
+            lookahead_.clear();lookahead_at_=0;
             sync_errors_ = 0;
             pcm_.clear();
             consumed_ = 0;

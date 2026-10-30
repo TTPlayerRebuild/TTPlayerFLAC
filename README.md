@@ -1,5 +1,7 @@
 # ttp_flac
 
+FLAC 内 DTS 二次解码（2026.10.29）：[实现、边界与三系统验证](docs/FLAC_DTS_SUPPORT_20261029.md)。此类文件需要同目录配套的重建 `ttp_ac3dts.dll`；普通 FLAC／TTA 不新增依赖。
+
 最新补全与验收：[2026-10-24](docs/COMPLETION_20261024.md)。
 
 TTA 历史浮点位模式与三系统定位验证：[边界记录](docs/TTA_FLOAT_BOUNDARIES_20261024.md)。
